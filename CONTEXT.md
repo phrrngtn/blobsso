@@ -198,14 +198,21 @@ Searched 2026-06-22:
    HTTP deps** (§4.1). CMake deps list for Stage 1 = just duckdb + httpfs headers.
 2. ~~**Scan community extensions**~~ — **DONE 2026-06-22: niche unfilled** (§6); duckdb-aws
    `credential_chain` is AWS-STS-only and can't target MinIO STS.
-3. **Scaffold** the blob* C++ extension (← NEXT): clone the duckdb extension template locally
-   (Mac), CMake + FetchContent, register a **stub `sso` provider for `TYPE s3`** that
-   round-trips params into a `KeyValueSecret` (tracer bullet that builds + loads + shows
-   in `duckdb_secrets()`), with a sqllogictest.
-4. **Stage 1 impl:** JWT (from `web_identity_token_file`/env) → STS POST → parse XML →
-   real `KeyValueSecret` + `refresh="auto"`. Test against **MinIO STS** on dc1
-   (`AssumeRoleWithWebIdentity`).
-5. Defer **Stage 2** (SPNEGO/blobhttp) until Stage 1 works end-to-end.
+3. ~~**Scaffold**~~ — **DONE 2026-06-22** (official extension-template, duckdb v1.5.4).
+4. ~~**Stage 1 impl**~~ — **DONE 2026-06-22 (client-first).** `CreateS3SecretFromSSO`:
+   JWT (`token` inline / `web_identity_token_file` / `AWS_WEB_IDENTITY_TOKEN_FILE`) →
+   form-encoded `AssumeRoleWithWebIdentity` POST via httpfs `HTTPUtil` → parse XML →
+   `KeyValueSecret` (key_id/secret/session_token/expiration, redacted). Verified:
+   `test/mock_sts_test.py` (mock STS success round-trip) + live POST to MinIO on dc1
+   (surfaces real STS XML; errors only because the dummy token isn't trusted yet).
+   **Refresh-on-expiry NOT yet wired** (TODO in create_fn).
+5. **Stage 2 (← NEXT): the Kerberos→JWT bridge.** dc1 has Samba AD (Kerberos/LDAP) but
+   **no OIDC IdP** — see [[dc1-infrastructure-inventory]]. Plan agreed with user
+   2026-06-22: *client-first then Keycloak; skip the AD/LDAP-bind mechanism.* So next:
+   deploy **Keycloak** on dc1 federated to Samba AD with SPNEGO, register an SPN/keytab,
+   configure MinIO `identity_openid` to trust it; blobsso acquires the JWT via
+   `Authorization: Negotiate` (reuse `blobhttp` `negotiate_auth.{hpp,cpp}`). Needs user
+   go-ahead to provision the Keycloak container on dc1 (shared state).
 
 ## 9. User working preferences (from CLAUDE.md + this session)
 
