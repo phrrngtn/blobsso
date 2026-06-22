@@ -1,0 +1,42 @@
+# name: test/sql/blobsso.test
+# description: blobsso 'sso' secret provider — Stage 1 tracer bullet (round-trips config into an s3 secret)
+# group: [sql]
+
+# Pull the prebuilt, signed httpfs at test time — it registers the s3 secret type
+# our 'sso' provider attaches to. We do NOT compile httpfs into this build.
+statement ok
+INSTALL httpfs;
+
+statement ok
+LOAD httpfs;
+
+require blobsso
+
+# The sso provider stub round-trips its config params into a KeyValueSecret.
+# (Stage 1: no real STS call yet — creds are placeholders so the round-trip is observable.)
+statement ok
+CREATE SECRET test_sso (
+    TYPE s3,
+    PROVIDER sso,
+    token_endpoint 'https://idp.example/token',
+    role_arn 'arn:aws:iam::000000000000:role/duck',
+    sts_endpoint 'http://127.0.0.1:9000',
+    region 'us-east-1',
+    endpoint '127.0.0.1:9000',
+    url_style 'path'
+);
+
+# It should appear as an s3 secret provided by 'sso'
+query III
+SELECT name, type, provider FROM duckdb_secrets() WHERE name = 'test_sso';
+----
+test_sso	s3	sso
+
+# Config params survive into the secret (endpoint + url_style are not redacted)
+query I
+SELECT secret_string LIKE '%127.0.0.1:9000%' FROM duckdb_secrets() WHERE name = 'test_sso';
+----
+true
+
+statement ok
+DROP SECRET test_sso;

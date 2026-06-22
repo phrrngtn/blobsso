@@ -18,19 +18,42 @@ the object-store side is the remaining secret. This extension closes that gap wi
 
 ## 2. Current status
 
-- Local git repo at `~/checkouts/blobsso` (renamed from `blobauth`; `git init` done,
-  **no remote yet**, README + this file are the only contents, **not yet committed**).
-- **No code/scaffold written yet.** We finished the design/API research and are about
-  to scaffold. Decisions below are mostly settled; two are open.
-- **Develop locally on the Mac** (user asked — confirmed). The DuckDB extension
-  template builds fine with the local Homebrew toolchain via FetchContent. dc1 is the
-  *deploy/test* target (MinIO + the lake live there), not the dev box.
+- Local git repo at `~/checkouts/blobsso` (renamed from `blobauth`; **no remote yet**).
+- **Scaffolded 2026-06-22** from the official `duckdb/extension-template` (chosen over
+  mirroring blobhttp's hand-rolled harness). `src/blobsso_extension.cpp` registers the
+  **Stage 1 tracer-bullet `sso` provider for `TYPE s3`** — round-trips config into a
+  `KeyValueSecret` (placeholder creds + `refresh=auto`); real STS call is the next edit.
+  Test: `test/sql/blobsso.test`.
+- **Pinned to duckdb `v1.5.4`** (and `extension-ci-tools v1.5.4`) as git submodules —
+  NOT a `main` commit. Why: the C++ extension ABI is version-locked, and we want
+  runtime `INSTALL httpfs; LOAD httpfs;` in tests to resolve a **prebuilt** httpfs from
+  extensions.duckdb.org. A `main`/untagged shallow clone reports version `v0.0.1` →
+  `INSTALL httpfs` 404s. A real release tag fixes both. To bump duckdb, re-pin BOTH
+  submodules to the same `vX.Y.Z` tag and clean-rebuild.
+- **httpfs is NOT compiled in** (it's out-of-tree; `duckdb_extension_load(httpfs)`
+  fails — "not an existing directory"). We only need the **s3 secret type** it
+  registers (and later its core HTTPUtil), both available at runtime → tests do
+  `INSTALL httpfs; LOAD httpfs;`. So blobsso links **zero** external libs (no OpenSSL).
+- **Build:** `VCPKG_TOOLCHAIN_PATH=~/vcpkg/scripts/buildsystems/vcpkg.cmake make`
+  (first build compiles duckdb core once — unavoidable, see §3; later edits relink in
+  seconds). Artifacts: `build/release/duckdb`, `build/release/test/unittest`.
+- **Develop locally on the Mac** (confirmed). dc1 is the *deploy/test* target
+  (MinIO + the lake live there), not the dev box.
 
 ## 3. The DuckDB secret-provider API (verified, the crux)
 
 Verified against `duckdb/duckdb-aws` `src/aws_secret.cpp` (cloned on dc1 at
 `/tmp/duckdb-aws`). It is **core C++ only — NOT in the C extension API**, so a C++
 extension is mandatory (the user independently reached the same conclusion).
+
+**Confirmed 2026-06-22 at the header level** (local duckdb submodule @ 08e34c44): the
+security/secret surface is entirely absent from the stable **C jump table** — both
+`src/include/duckdb.h` and the C-extension struct `src/include/duckdb_extension.h`
+have **zero** occurrences of `secret` (vs. `duckdb_register_scalar_function` which IS
+present at `duckdb.h:3821`). Consequence chain: secret provider ⇒ C++-only API ⇒
+unstable ABI ⇒ must build against matching duckdb **source** (this is why the one-time
+duckdb-core compile is unavoidable; a stable-ABI version-independent C extension is
+**not** possible for a secret provider).
 
 A provider is literally a struct + a create function:
 ```cpp
