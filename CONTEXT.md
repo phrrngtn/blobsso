@@ -1,0 +1,180 @@
+# blobsso — Context & Handoff
+
+*Written 2026-06-22 to let a fresh Claude Code session resume with minimal context.
+Working name `blobsso` (was `blobauth`; may still change). Owner: phrrngtn.*
+
+## 1. What we're building
+
+A **DuckDB C++ extension** providing **enterprise SSO → temporary S3 credentials**,
+so DuckDB `httpfs` can read/write an S3-compatible store (MinIO on dc1) using the
+**OS/enterprise identity** instead of static, long-lived access keys.
+
+Motivation: the `ha_ducklake` lakehouse (Postgres catalog + MinIO Parquet + DuckDB
+compute) currently uses **static MinIO access keys** in a DuckDB `CREATE SECRET
+(TYPE s3, KEY_ID …, SECRET …)`. We made the *Postgres* side password-less (peer auth);
+the object-store side is the remaining secret. This extension closes that gap with
+**STS temporary credentials** that auto-rotate — the object-store analogue of
+"integrated security."
+
+## 2. Current status
+
+- Local git repo at `~/checkouts/blobsso` (renamed from `blobauth`; `git init` done,
+  **no remote yet**, README + this file are the only contents, **not yet committed**).
+- **No code/scaffold written yet.** We finished the design/API research and are about
+  to scaffold. Decisions below are mostly settled; two are open.
+- **Develop locally on the Mac** (user asked — confirmed). The DuckDB extension
+  template builds fine with the local Homebrew toolchain via FetchContent. dc1 is the
+  *deploy/test* target (MinIO + the lake live there), not the dev box.
+
+## 3. The DuckDB secret-provider API (verified, the crux)
+
+Verified against `duckdb/duckdb-aws` `src/aws_secret.cpp` (cloned on dc1 at
+`/tmp/duckdb-aws`). It is **core C++ only — NOT in the C extension API**, so a C++
+extension is mandatory (the user independently reached the same conclusion).
+
+A provider is literally a struct + a create function:
+```cpp
+// {secret_type, provider_name, create_fn}
+CreateSecretFunction f = {"s3", "sso", CreateS3SecretFromSSO};
+f.named_parameters["token_endpoint"] = LogicalType::VARCHAR;   // CREATE SECRET params
+f.named_parameters["role_arn"]       = LogicalType::VARCHAR;
+// ... region, sts_endpoint, endpoint, url_style, web_identity_token_file, etc.
+loader.RegisterFunction(f);   // ExtensionLoader& in Load(); also register the s3 type
+
+// create_fn(ClientContext&, CreateSecretInput&) -> unique_ptr<BaseSecret>:
+//   1. read params from CreateSecretInput
+//   2. obtain temp creds (the real work — see §4)
+//   3. build a KeyValueSecret; set secret_map["key_id"/"secret"/"session_token"/
+//      "region"/"endpoint"/"url_style"/"use_ssl"]
+//   4. result->secret_map["refresh"] = "auto";   // DuckDB re-invokes create_fn on expiry
+```
+Key facts:
+- `refresh="auto"` is the rotation hook — DuckDB re-runs `create_fn` when creds expire.
+  This is how STS short-lived creds stay fresh transparently.
+- In duckdb-aws, the base S3 secret is built by `ConstructBaseS3Secret(scope, type,
+  provider, name)`; `secret_map["region"]=…` etc. Mirror that shape.
+- Registration (`CreateAwsSecretFunctions::Register(ExtensionLoader&)`) loops secret
+  types {s3,r2,gcs,aws,rds} and sets `named_parameters` per function. We only need `s3`
+  (and maybe `r2`/`gcs` later).
+- duckdb-aws's `credential_chain` provider auto-sets `refresh="auto"` for the
+  web_identity/STS chains — same idea we want.
+
+## 4. The reframe that shrinks the project (IMPORTANT)
+
+The provider function is tiny. **The only real work is one outbound STS call**
+(`AssumeRoleWithWebIdentity`) + parsing its small XML response into
+key_id/secret/session_token/expiration. So the question "what HTTP/crypto deps do we
+need?" decomposes:
+
+1. **STS exchange (JWT already in hand → temp creds):** a plain HTTPS POST, no special
+   auth. Body is form-encoded (`Action=AssumeRoleWithWebIdentity&WebIdentityToken=<jwt>
+   &RoleArn=<arn>&Version=2011-06-15`); response is XML. This can ride **DuckDB's core
+   `HTTPUtil`/`HTTPClient`** abstraction (the one `httpfs` implements) → **we link no
+   HTTP library**. We'd only need a tiny XML scrape (hand-rolled or tinyxml2).
+   - **OPEN/VERIFY:** is the core `HTTPUtil` POST API reachable from *another* extension
+     at secret-create time (needs httpfs loaded)? `duckdb-httpfs` is cloned on dc1 at
+     `/tmp/duckdb-httpfs` — grep its `src`/`extension` and DuckDB core for
+     `HTTPUtil` / `HTTPClient` / `http_util.hpp` / `PostRequest`. (Earlier grep on the
+     httpfs *extension* dir found nothing; the abstraction likely lives in DuckDB
+     **core** `src/include/duckdb/main/http_util.hpp`, registered via the DB instance.)
+   - Fallback if not reachable: link our **own libcurl** for the STS POST (light, and
+     gives SPNEGO for free). aws-sdk-cpp is rejected as too heavy for one call.
+
+2. **Acquiring the JWT via Kerberos/SPNEGO** (`Authorization: Negotiate`): httpfs's HTTP
+   stack will **not** do GSSAPI/`CURLAUTH_NEGOTIATE`. This needs **libcurl + GSSAPI**
+   (the `blobhttp` core). BUT it's only needed if the JWT comes from a Kerberos-
+   protected endpoint. **If the JWT is supplied via file / env / plain OIDC GET, no
+   GSSAPI and no libcurl at all.**
+
+**Staging that falls out of this:**
+- **Stage 1 (zero new deps):** S3 SSO provider. JWT obtained from `web_identity_token_file`
+  / env / plain GET → STS POST (via httpfs `HTTPUtil`, or our curl fallback) →
+  `KeyValueSecret` + `refresh="auto"`. ~80% of the value: rotating, key-less S3 access.
+- **Stage 2 (adds GSSAPI):** SPNEGO to *obtain* the JWT from a Kerberos endpoint, and/or
+  a `negotiate_token()` / `TYPE http` secret to inject `Authorization: Negotiate` for
+  stock httpfs. Reuse `blobhttp`'s GSSAPI core.
+
+## 5. Decisions
+
+| # | Decision | Status |
+|---|----------|--------|
+| C++ (not C) extension | secret-provider API is C++-core only | **settled** |
+| Name | `blobsso` | settled (may still change) |
+| Dev location | local Mac; dc1 is deploy/test | **settled** |
+| STS via aws-sdk-cpp? | **No** — too heavy for one POST | settled |
+| STS HTTP transport | prefer **reuse httpfs `HTTPUtil`** (zero deps); curl fallback | **open — verify API** |
+| SPNEGO placement | reuse/extend **blobhttp** GSSAPI core (shared lib) | leaning, Stage 2 |
+| Scope first cut | **Stage 1** (JWT→STS→secret), no SPNEGO yet | settled |
+
+## 6. Prior art / community extensions (don't reinvent)
+
+Searched 2026-06-22:
+- **`quack-oauth`** (DataZooDE) — OAuth 2.1/OIDC for the *duckdb-quack server* protocol:
+  validates bearer JWTs (JWKS / RFC 7662 introspection / tokeninfo) and gates
+  ATTACH/SELECT/COPY by policy. **Server-side auth, not a secret provider** — different
+  problem, but a reference for JWT validation code in a DuckDB extension.
+  https://github.com/DataZooDE/quack-oauth
+- **`jwt`** community extension — decode/inspect JWTs in SQL. Useful primitive if we
+  need to read token claims (e.g. exp) in-engine.
+  https://duckdb.org/community_extensions/extensions/jwt
+- **httpfs `TYPE http` secret** — `CREATE SECRET (TYPE http, BEARER_TOKEN '…')` and
+  custom/`EXTRA_HTTP_HEADERS` **exist** — this is the injection point for Face 2
+  (Negotiate header) without patching httpfs. Confirm exact param names against the
+  installed httpfs version.
+- A community **HTTP-client TVF extension with SPNEGO/Negotiate** reportedly exists
+  (GET/POST table functions). Possibly relevant prior art for the Kerberos path — and
+  the user's own **`blobhttp`** already implements SPNEGO/GSSAPI. **Next session:** scan
+  https://duckdb.org/community_extensions/list_of_extensions and
+  https://github.com/mehd-io/duckdb-extension-radar for an existing STS/SSO secret
+  provider before writing our own, to avoid duplicating effort.
+- **`duckdb-aws`** core extension — the template we're mirroring; its `credential_chain`
+  provider already does env/profile/web_identity → creds with `refresh=auto`. We are
+  essentially adding an **`sso` provider variant** that does the JWT→STS step explicitly
+  (and, later, the SPNEGO-for-JWT step) for **non-AWS / MinIO** STS endpoints.
+
+## 7. Resources & locations
+
+- **This repo:** `~/checkouts/blobsso` (Mac).
+- **Reference clones on dc1** (`ssh phrrngtn@dc1`):
+  - `/tmp/duckdb-aws` — `src/aws_secret.cpp` is THE provider template (see §3).
+  - `/tmp/duckdb-httpfs` — for finding the HTTP secret type + the `HTTPUtil` abstraction.
+  - `/tmp/ducklake_src` — DuckLake source (unrelated to this project).
+  (These are throwaway `/tmp` clones; re-clone locally on the Mac for dev.)
+- **blob\* family convention** (`~/checkouts/CLAUDE.md`): C/C++ core + thin
+  SQLite/DuckDB/Python wrappers, CMake + FetchContent; *business logic in the shared C
+  library, thin shims*. Siblings: `blobtemplates`, `blobboxes`, `blobfilters`,
+  `blobodbc`, `blobhttp` (← has the SPNEGO/GSSAPI code to reuse), `blobrule4`, `blobembed`.
+- **Consumer / why this exists:** `~/checkouts/ha_ducklake` (the lakehouse replicator)
+  and `~/checkouts/ducklake_oob_writer`. The S3 secret it would replace is in
+  `ha_ducklake/src/ha_ducklake/config.py` → `S3Config.create_secret_sql()` (currently
+  static `KEY_ID`/`SECRET`). MinIO runs in `/opt/ha-stack` on dc1 (endpoint
+  `127.0.0.1:9000`, console open). Roadmap note parked in
+  `~/research/DuckLake Lakehouse Roadmap.md` ("SPNEGO→STS secret provider [must be C++]").
+- **Docs convention:** high-level `docs/*.md` get symlinked into `~/research/`
+  (Obsidian vault) — `ln -s ~/checkouts/blobsso/docs/<Note>.md ~/research/<Note>.md`.
+
+## 8. Next steps (for the fresh session)
+
+1. **Verify the `HTTPUtil` cross-extension API** (§4.1) — decide deps (httpfs-reuse vs
+   own libcurl). This unblocks the CMake deps list.
+2. **Scan community extensions** (§6) for an existing STS/SSO secret provider.
+3. **Scaffold** the blob* C++ extension: clone the duckdb extension template locally
+   (Mac), CMake + FetchContent, register a **stub `sso` provider for `TYPE s3`** that
+   round-trips params into a `KeyValueSecret` (tracer bullet that builds + loads + shows
+   in `duckdb_secrets()`), with a sqllogictest.
+4. **Stage 1 impl:** JWT (from `web_identity_token_file`/env) → STS POST → parse XML →
+   real `KeyValueSecret` + `refresh="auto"`. Test against **MinIO STS** on dc1
+   (`AssumeRoleWithWebIdentity`).
+5. Defer **Stage 2** (SPNEGO/blobhttp) until Stage 1 works end-to-end.
+
+## 9. User working preferences (from CLAUDE.md + this session)
+
+- Terse; lead with action/result, no trailing summaries. Don't ask permission for
+  trivially reversible local actions; **do** ask before shared-state ops (git push, PR,
+  Docker). Outline a plan before large architectural/vendoring decisions.
+- Python: brew Python via `uv` only (`uv run python`), inline scripts to a temp file
+  then `uv run`. (Mostly irrelevant here — this is C++.)
+- Prefers **integrated security / password-less** everywhere (drove this whole project).
+- "Business logic in the shared C library; thin shims." Don't duplicate (→ reuse blobhttp).
+- Forgejo on dc1 for self-hosted remotes (see `~/checkouts/CLAUDE.md` for API/mTLS);
+  also publishes to GitHub. No remote created for blobsso yet.
