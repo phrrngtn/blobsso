@@ -71,14 +71,24 @@ need?" decomposes:
    &RoleArn=<arn>&Version=2011-06-15`); response is XML. This can ride **DuckDB's core
    `HTTPUtil`/`HTTPClient`** abstraction (the one `httpfs` implements) → **we link no
    HTTP library**. We'd only need a tiny XML scrape (hand-rolled or tinyxml2).
-   - **OPEN/VERIFY:** is the core `HTTPUtil` POST API reachable from *another* extension
-     at secret-create time (needs httpfs loaded)? `duckdb-httpfs` is cloned on dc1 at
-     `/tmp/duckdb-httpfs` — grep its `src`/`extension` and DuckDB core for
-     `HTTPUtil` / `HTTPClient` / `http_util.hpp` / `PostRequest`. (Earlier grep on the
-     httpfs *extension* dir found nothing; the abstraction likely lives in DuckDB
-     **core** `src/include/duckdb/main/http_util.hpp`, registered via the DB instance.)
-   - Fallback if not reachable: link our **own libcurl** for the STS POST (light, and
-     gives SPNEGO for free). aws-sdk-cpp is rejected as too heavy for one call.
+   - **VERIFIED 2026-06-22 — YES, reachable cross-extension (zero new deps).** Evidence
+     (against local clone `~/checkouts/duckdb-httpfs`, which vendors duckdb core):
+     - Header to include: `duckdb/common/http_util.hpp` (core, **`common/` not `main/`**),
+       defines `HTTPUtil`, `HTTPParams`, `HTTPHeaders`, `HTTPResponse`, `PostRequestInfo`.
+     - Retrieval: `static HTTPUtil &HTTPUtil::Get(DatabaseInstance &db)` returns
+       `db.config.http_util` (`duckdb/src/main/http/http_util.cpp:91`). It's a
+       `shared_ptr<HTTPUtil>` on `DBConfig` — a base class **set by httpfs at load**
+       (`httpfs_extension.cpp:206` and `:230`, `make_shared_ptr<HTTPFSCurlUtil>()`).
+     - POST: build `PostRequestInfo(url, headers, params, body_ptr, body_len)`, call
+       `http_util.Request(post_req)` → `unique_ptr<HTTPResponse>`; response body in
+       `post_req.buffer_out` / `response->body`. Real caller pattern:
+       `HTTPFileSystem::PostRequest` (`src/httpfs.cpp:172`). Core also self-uses it in
+       `extension_install.cpp` (`auto &http_util = HTTPUtil::Get(db);`).
+     - **Only constraint:** httpfs must be loaded before our create_fn runs (we depend on
+       it for S3 anyway). If `config.http_util` is unset → require/`LoadExtension("httpfs")`
+       or error with a clear message.
+   - Fallback (now unlikely needed): link our **own libcurl** for the STS POST. aws-sdk-cpp
+     stays rejected as too heavy for one call.
 
 2. **Acquiring the JWT via Kerberos/SPNEGO** (`Authorization: Negotiate`): httpfs's HTTP
    stack will **not** do GSSAPI/`CURLAUTH_NEGOTIATE`. This needs **libcurl + GSSAPI**
@@ -102,8 +112,8 @@ need?" decomposes:
 | Name | `blobsso` | settled (may still change) |
 | Dev location | local Mac; dc1 is deploy/test | **settled** |
 | STS via aws-sdk-cpp? | **No** — too heavy for one POST | settled |
-| STS HTTP transport | prefer **reuse httpfs `HTTPUtil`** (zero deps); curl fallback | **open — verify API** |
-| SPNEGO placement | reuse/extend **blobhttp** GSSAPI core (shared lib) | leaning, Stage 2 |
+| STS HTTP transport | **reuse httpfs `HTTPUtil`** (zero deps) — verified reachable | **settled (2026-06-22, see §4.1)** |
+| SPNEGO placement | reuse/extend **blobhttp** GSSAPI core (`negotiate_auth.{hpp,cpp}`) | leaning, Stage 2 |
 | Scope first cut | **Stage 1** (JWT→STS→secret), no SPNEGO yet | settled |
 
 ## 6. Prior art / community extensions (don't reinvent)
@@ -131,6 +141,12 @@ Searched 2026-06-22:
   provider already does env/profile/web_identity → creds with `refresh=auto`. We are
   essentially adding an **`sso` provider variant** that does the JWT→STS step explicitly
   (and, later, the SPNEGO-for-JWT step) for **non-AWS / MinIO** STS endpoints.
+  - **CONFIRMED 2026-06-22 (read `aws_secret.cpp` on GitHub) — `credential_chain` cannot
+    do our job.** It accepts `web_identity_token_file` + `assume_role_arn`, but routes
+    everything through **aws-sdk-cpp's** provider chain → **AWS STS only**. Its `endpoint`
+    param configures the **S3 storage** service, *not* STS; there is **no custom STS
+    endpoint** and no custom token-source/endpoint param. So it categorically can't target
+    MinIO STS or a SPNEGO/OIDC token endpoint. **No existing extension fills this niche.**
 
 ## 7. Resources & locations
 
@@ -155,10 +171,11 @@ Searched 2026-06-22:
 
 ## 8. Next steps (for the fresh session)
 
-1. **Verify the `HTTPUtil` cross-extension API** (§4.1) — decide deps (httpfs-reuse vs
-   own libcurl). This unblocks the CMake deps list.
-2. **Scan community extensions** (§6) for an existing STS/SSO secret provider.
-3. **Scaffold** the blob* C++ extension: clone the duckdb extension template locally
+1. ~~**Verify the `HTTPUtil` cross-extension API**~~ — **DONE 2026-06-22: reuse it, zero
+   HTTP deps** (§4.1). CMake deps list for Stage 1 = just duckdb + httpfs headers.
+2. ~~**Scan community extensions**~~ — **DONE 2026-06-22: niche unfilled** (§6); duckdb-aws
+   `credential_chain` is AWS-STS-only and can't target MinIO STS.
+3. **Scaffold** the blob* C++ extension (← NEXT): clone the duckdb extension template locally
    (Mac), CMake + FetchContent, register a **stub `sso` provider for `TYPE s3`** that
    round-trips params into a `KeyValueSecret` (tracer bullet that builds + loads + shows
    in `duckdb_secrets()`), with a sqllogictest.
