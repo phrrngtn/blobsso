@@ -65,14 +65,14 @@ static std::string Base64Encode(const void *data, size_t len) {
 // URL hostname extraction (standalone, no curl dependency)
 // ---------------------------------------------------------------------------
 
-static std::string ExtractHostname(const std::string &url) {
+static std::string ExtractHostname(const std::string &url, bool allow_insecure = false) {
 	// Simple hostname extraction: skip scheme, extract host before port/path
 	auto pos = url.find("://");
 	if (pos == std::string::npos) {
 		throw std::runtime_error("Invalid URL (no scheme): " + url);
 	}
 	auto scheme = url.substr(0, pos);
-	if (scheme != "https") {
+	if (scheme != "https" && !allow_insecure) {
 		throw std::runtime_error("Negotiate authentication requires HTTPS. "
 		                         "Sending Kerberos tokens over plain HTTP exposes credentials to replay attacks.");
 	}
@@ -119,8 +119,8 @@ std::string GetProviderName() {
 	return "SSPI";
 }
 
-NegotiateResult GenerateNegotiateToken(const std::string &url) {
-	auto hostname = ExtractHostname(url);
+NegotiateResult GenerateNegotiateToken(const std::string &url, bool allow_insecure) {
+	auto hostname = ExtractHostname(url, allow_insecure);
 
 	// SSPI uses "HTTP/hostname" (forward slash) for the SPN
 	auto spn_narrow = "HTTP/" + hostname;
@@ -361,7 +361,7 @@ std::string GetProviderName() {
 #endif
 }
 
-NegotiateResult GenerateNegotiateToken(const std::string &url) {
+NegotiateResult GenerateNegotiateToken(const std::string &url, bool allow_insecure) {
 	std::call_once(gss_init_flag, InitGSSAPI);
 
 	if (!gss_available) {
@@ -369,7 +369,7 @@ NegotiateResult GenerateNegotiateToken(const std::string &url) {
 		                         "On Linux, install libkrb5-dev or krb5-libs. On macOS, GSS.framework should be present.");
 	}
 
-	auto hostname = ExtractHostname(url);
+	auto hostname = ExtractHostname(url, allow_insecure);
 
 	// Build the SPN: "HTTP@hostname"
 	auto spn = "HTTP@" + hostname;

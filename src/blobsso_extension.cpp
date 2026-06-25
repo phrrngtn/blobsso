@@ -142,10 +142,13 @@ static string AcquireTokenViaSpnego(ClientContext &context, HTTPUtil &http_util,
 		                            issuer);
 	}
 
-	// 2. SPNEGO token for HTTP/<auth-host> from the OS Kerberos credential
+	// 2. SPNEGO token for HTTP/<auth-host> from the OS Kerberos credential.
+	// By default Negotiate requires HTTPS (replay protection); allow_http_negotiate
+	// opts into plain HTTP when the transport is already encrypted (e.g. Tailscale).
+	const bool allow_http = GetOption(input, "allow_http_negotiate") == "true";
 	string negotiate;
 	try {
-		negotiate = blobhttp::GenerateNegotiateToken(auth_endpoint).token;
+		negotiate = blobhttp::GenerateNegotiateToken(auth_endpoint, allow_http).token;
 	} catch (const std::exception &e) {
 		throw InvalidInputException("blobsso 'sso' provider: SPNEGO/Kerberos token generation failed (%s). "
 		                            "Do you have a ticket (kinit)?",
@@ -286,6 +289,7 @@ static void RegisterSSOSecretProvider(ExtensionLoader &loader) {
 	sso.named_parameters["client_id"] = LogicalType::VARCHAR;
 	sso.named_parameters["client_secret"] = LogicalType::VARCHAR;
 	sso.named_parameters["redirect_uri"] = LogicalType::VARCHAR;
+	sso.named_parameters["allow_http_negotiate"] = LogicalType::BOOLEAN; // opt-in: SPNEGO over plain HTTP
 	// STS target
 	sso.named_parameters["sts_endpoint"] = LogicalType::VARCHAR;
 	sso.named_parameters["role_arn"] = LogicalType::VARCHAR;

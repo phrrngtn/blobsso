@@ -18,7 +18,9 @@ struct NegotiateResult {
 //! Extracts the hostname from the URL to construct the SPN,
 //! then acquires a SPNEGO token via GSS-API (macOS/Linux) or SSPI (Windows).
 //! Throws std::runtime_error if no security provider is available or token generation fails.
-NegotiateResult GenerateNegotiateToken(const std::string &url);
+//! allow_insecure permits plain-HTTP target URLs (e.g. when the transport is
+//! already encrypted by an overlay such as Tailscale/WireGuard); default false.
+NegotiateResult GenerateNegotiateToken(const std::string &url, bool allow_insecure = false);
 
 //! Returns true if a security provider (GSS-API or SSPI) is available on this system.
 bool NegotiateAuthIsAvailable();
