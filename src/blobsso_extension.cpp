@@ -276,6 +276,17 @@ static unique_ptr<BaseSecret> CreateS3SecretFromSSO(ClientContext &context, Crea
 	for (const auto *key : {"region", "endpoint", "url_style", "use_ssl"}) {
 		result->TrySetValue(key, input);
 	}
+
+	// Auto-rotation: store the creation options as `refresh_info` so httpfs, on an
+	// expired-credential failure, re-invokes this provider (re-running SPNEGO/STS
+	// for fresh temporary credentials) via CreateS3SecretFunctions::TryRefreshS3Secret.
+	child_list_t<Value> refresh_children;
+	for (const auto &opt : input.options) {
+		refresh_children.emplace_back(opt.first, opt.second);
+	}
+	if (!refresh_children.empty()) {
+		result->secret_map["refresh_info"] = Value::STRUCT(std::move(refresh_children));
+	}
 	return std::move(result);
 }
 
