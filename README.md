@@ -1,11 +1,10 @@
 # blobsso  *(working name — may change)*
 
+> **Note:** This code is almost entirely AI-authored (Claude, Anthropic), albeit under close human supervision, and is for research and experimentation purposes. Successful experiments may be re-implemented in a more coordinated and curated manner.
+
 A **DuckDB C++ extension** that acts as an enterprise **SSO / STS secret provider**
 for object-store (S3-compatible) access — and optionally a **SPNEGO/Negotiate**
 helper so stock `httpfs` can talk to Kerberos-protected HTTPS without static keys.
-
-> **Note:** AI-authored (Claude, Anthropic) under close human supervision; research
-> and experimentation.
 
 > **Read `CONTEXT.md` first** — it is the full design/decision handoff (written so a
 > fresh session can resume cleanly). This README is the short version.
