@@ -26,6 +26,13 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} ${CMAKE_DL_LIBS})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CMAKE_DL_LIBS})
 
+# Windows: the vendored negotiate code uses SSPI (AcquireCredentialsHandle, etc.),
+# which lives in secur32. (macOS/Linux use dlopen'd GSS-API instead — no link need.)
+if(WIN32)
+  target_link_libraries(${EXTENSION_NAME} secur32)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} secur32)
+endif()
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"

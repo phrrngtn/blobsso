@@ -83,8 +83,11 @@ CREATE SECRET mock_sso (
 SELECT name, type, provider, secret_string FROM duckdb_secrets() WHERE name='mock_sso';
 """
     out = subprocess.run(
-        [str(DUCKDB), "-noheader", "-list"], input=sql,
-        capture_output=True, text=True, timeout=60,
+        [str(DUCKDB), "-noheader", "-list"],
+        input=sql,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     server.shutdown()
 

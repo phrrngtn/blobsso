@@ -176,8 +176,8 @@ static string AcquireTokenViaSpnego(ClientContext &context, HTTPUtil &http_util,
 	const string code = location.substr(cpos, cend == string::npos ? string::npos : cend - cpos);
 
 	// 4. Exchange the code for the JWT
-	string token_body = "grant_type=authorization_code&code=" + UrlEncode(code) +
-	                    "&client_id=" + UrlEncode(client_id) + "&redirect_uri=" + UrlEncode(redirect_uri);
+	string token_body = "grant_type=authorization_code&code=" + UrlEncode(code) + "&client_id=" + UrlEncode(client_id) +
+	                    "&redirect_uri=" + UrlEncode(redirect_uri);
 	if (!client_secret.empty()) {
 		token_body += "&client_secret=" + UrlEncode(client_secret);
 	}

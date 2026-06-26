@@ -1,6 +1,7 @@
 # name: test/sql/blobsso.test
 # description: blobsso 'sso' s3 secret provider — registration + input validation
 # group: [sql]
+
 #
 # This covers the deterministic, network-free path: the provider is registered
 # against the s3 secret type and validates its inputs. The positive path (a real
