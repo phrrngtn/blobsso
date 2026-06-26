@@ -1,0 +1,34 @@
+#
+# Self-hosted build on the Forgejo fleet (dc1 + this Mac).
+# GitHub ignores .forgejo/; GitHub Actions multi-arch lives in .github/workflows/.
+# Runner labels: dc1-container-runner=linux-x86_64 (docker://blob-builder),
+#                mac-host-runner=macos-arm64 (host). mac-docker-runner (linux-arm64)
+#                is node:20-bookworm with no C++ toolchain, so it's not targeted here.
+#
+name: build (self-hosted)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: linux-x86_64, runner: linux-x86_64 }
+          - { arch: macos-arm64, runner: macos-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build extension
+        run: make
+
+      - name: Test
+        run: make test
