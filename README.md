@@ -41,6 +41,47 @@ flowchart LR
   HF -. "creds expired (403):<br/>httpfs re-invokes the provider" .-> ACQ
 ```
 
+## Proof by construction: DuckDB-native SSO
+
+blobsso is a working demonstration that enterprise **SSO → temporary S3 credentials** can
+live entirely *inside* DuckDB — no client-side SDK, no static keys, no separate broker. The
+whole identity → STS → S3 flow is a **SQL-loadable secret provider**, driven by ordinary SQL:
+
+```sql
+CREATE SECRET lake (
+  TYPE s3, PROVIDER sso,
+  oidc_issuer 'https://keycloak/realms/lake', client_id 'minio',
+  sts_endpoint 'https://minio:9000/', endpoint 'minio:9000'
+);
+SELECT * FROM read_parquet('s3://lake/sales/*.parquet');
+```
+
+Because it's registered at the SQL layer, **any** DuckDB client gets SSO'd access to on-prem
+MinIO for free — the CLI, Python, JDBC, and crucially **ODBC → Tableau / Power BI / Excel**:
+
+```mermaid
+flowchart TD
+  C1["CLI · Python · JDBC"] --> DDB
+  C2["ODBC → Tableau / BI"] --> DDB
+  DDB["DuckDB + blobsso<br/>CREATE SECRET … PROVIDER sso"]
+  DDB -. "① pre-flight SPNEGO<br/>ambient kinit ticket — no browser" .-> KC["Keycloak / OIDC"]
+  KC -. "JWT" .-> DDB
+  DDB -. "② AssumeRoleWithWebIdentity" .-> STS["MinIO STS"]
+  STS -. "temp creds" .-> DDB
+  DDB ==>|"③ httpfs reads s3:// with temp creds"| M[("on-prem MinIO")]
+```
+
+**The linchpin is non-interactive auth.** A browser-based OIDC redirect is impossible from
+Tableau or a raw ODBC connection. blobsso's **pre-flight SPNEGO** uses the caller's *ambient
+Kerberos ticket* — no prompt, no redirect, no device code — so the whole SSO completes
+silently inside `CREATE SECRET`. That is what turns "surface Kerberos-gated on-prem MinIO to
+Tableau, keylessly" from impossible into a two-line SQL preamble.
+
+What it proves, concretely:
+- **No static keys** — credentials are short-lived STS tokens, auto-rotated (see [Refresh](#refresh--auto-rotation)).
+- **No client SDK or broker** — the AWS-style web-identity → STS exchange lives in the extension, reachable from any language that can issue SQL.
+- **No interactive step** — it runs headless, the hard requirement for BI tools and service accounts.
+
 ## Lightweight by design — no heavyweight dependencies
 
 The goal is enterprise SSO-style auth with the **smallest possible footprint**. The
