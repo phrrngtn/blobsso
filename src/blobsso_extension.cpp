@@ -185,8 +185,8 @@ static string SpnegoAuthorize(HTTPUtil &http_util, HTTPParams &params, const str
 static string OidcExchangeCode(HTTPUtil &http_util, HTTPParams &params, const string &token_endpoint,
                                const string &code, const string &client_id, const string &client_secret,
                                const string &redirect_uri) {
-	string token_body = "grant_type=authorization_code&code=" + UrlEncode(code) +
-	                    "&client_id=" + UrlEncode(client_id) + "&redirect_uri=" + UrlEncode(redirect_uri);
+	string token_body = "grant_type=authorization_code&code=" + UrlEncode(code) + "&client_id=" + UrlEncode(client_id) +
+	                    "&redirect_uri=" + UrlEncode(redirect_uri);
 	if (!client_secret.empty()) {
 		token_body += "&client_secret=" + UrlEncode(client_secret);
 	}
