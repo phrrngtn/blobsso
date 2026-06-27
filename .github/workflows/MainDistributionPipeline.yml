@@ -4,7 +4,9 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   workflow_dispatch:
 
 concurrency:

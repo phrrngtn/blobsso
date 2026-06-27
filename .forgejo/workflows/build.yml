@@ -10,6 +10,7 @@ name: build (self-hosted)
 
 on:
   push:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   workflow_dispatch:
 
 jobs:
