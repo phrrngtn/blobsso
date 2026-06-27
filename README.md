@@ -28,6 +28,19 @@ env / or **Kerberos SPNEGO** against an OIDC issuer) → **STS `AssumeRoleWithWe
 (AWS STS or MinIO STS) → **temporary credentials** in a `KeyValueSecret` → `httpfs`
 consumes them exactly like static keys, and they **auto-rotate** on expiry.
 
+```mermaid
+flowchart LR
+  subgraph ACQ["1 · acquire JWT"]
+    direction TB
+    T["inline token /<br/>web_identity_token_file / env"]
+    K["oidc_issuer:<br/>kinit → SPNEGO → Keycloak/OIDC"]
+  end
+  ACQ -->|JWT| STS["2 · STS<br/>AssumeRoleWithWebIdentity<br/>(AWS / MinIO)"]
+  STS -->|"temporary creds<br/>(key_id · secret · session_token · exp)"| SEC["3 · KeyValueSecret<br/>+ refresh_info"]
+  SEC --> HF["4 · httpfs · S3 read / write"]
+  HF -. "creds expired (403):<br/>httpfs re-invokes the provider" .-> ACQ
+```
+
 ## Lightweight by design — no heavyweight dependencies
 
 The goal is enterprise SSO-style auth with the **smallest possible footprint**. The
