@@ -345,6 +345,12 @@ static void NegotiateTokenDescribeFun(DataChunk &args, ExpressionState &, Vector
 	});
 }
 
+static void NegotiateTokenFromJsonFun(DataChunk &args, ExpressionState &, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t config) {
+		return StringVector::AddString(result, spnego::GenerateTokenFromConfig(config.GetString()).token);
+	});
+}
+
 static void RegisterNegotiateFunctions(ExtensionLoader &loader) {
 	// negotiate_token(url[, service]) -> base64 SPNEGO token (raises on failure)
 	ScalarFunctionSet token("negotiate_token");
@@ -361,6 +367,12 @@ static void RegisterNegotiateFunctions(ExtensionLoader &loader) {
 	                        NegotiateTokenDescribeFun);
 	describe.stability = FunctionStability::VOLATILE;
 	loader.RegisterFunction(describe);
+
+	// negotiate_token_from_json(config) -> token (strict property-bag; raises on bad config/failure)
+	ScalarFunction from_json("negotiate_token_from_json", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                         NegotiateTokenFromJsonFun);
+	from_json.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(from_json);
 }
 
 static void LoadInternal(ExtensionLoader &loader) {

@@ -106,6 +106,7 @@ entry on a `TYPE http` secret, ad-hoc SQL, etc. All are `VOLATILE` (a fresh toke
 | `negotiate_token(url)` | base64 SPNEGO token for `HTTP/<host>` (raises on failure) |
 | `negotiate_token(url, service)` | token for `<service>/<host>` — `LDAP`, `cifs`, `host`, … |
 | `negotiate_token_describe(url)` | a JSON diagnostics blob (SPN, provider, token-or-error); never raises |
+| `negotiate_token_from_json(config)` | strict JSON property-bag `{"url"\|"host", "service", "allow_insecure"}` → token |
 
 ```sql
 CREATE SECRET kerb (TYPE http, EXTRA_HTTP_HEADERS MAP {
