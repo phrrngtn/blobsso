@@ -84,8 +84,9 @@ extension built against a pinned duckdb version.
 | Token file | `web_identity_token_file` (or `AWS_WEB_IDENTITY_TOKEN_FILE` env) |
 | **Kerberos / SPNEGO** | `oidc_issuer`, `client_id`, `client_secret`, `redirect_uri`, `allow_http_negotiate` |
 
-**Kerberos/SPNEGO** (`oidc_issuer` set): `kinit` ticket → `GenerateNegotiateToken`
-(the dlopen'd GSS-API, vendored from `blobhttp`) → OIDC discovery → proactive
+**Kerberos/SPNEGO** (`oidc_issuer` set): `kinit` ticket → `spnego::GenerateTokenForUrl`
+(the dlopen'd GSS-API, from the shared [`spnego-token`](https://github.com/phrrngtn/spnego-token)
+submodule) → OIDC discovery → proactive
 `Authorization: Negotiate` auth-code GET → token exchange → JWT. The client's
 `krb5.conf` should set **`dns_canonicalize_hostname = false`** so the requested SPN
 matches the issuer host (`HTTP/<issuer-host>`) rather than a DNS-canonicalized name.
@@ -93,6 +94,24 @@ matches the issuer host (`HTTP/<issuer-host>`) rather than a DNS-canonicalized n
 By default SPNEGO requires **HTTPS** (replay protection); `allow_http_negotiate true`
 opts into plain HTTP when the transport is already encrypted by an overlay (e.g.
 WireGuard/Tailscale).
+
+## Scalar functions (preemptive Negotiate tokens)
+
+The same [`spnego-token`](https://github.com/phrrngtn/spnego-token) atom is also exposed
+as UDFs, so you can mint a token and drop it into any request — an `EXTRA_HTTP_HEADERS`
+entry on a `TYPE http` secret, ad-hoc SQL, etc. All are `VOLATILE` (a fresh token per call).
+
+| Function | Returns |
+|---|---|
+| `negotiate_token(url)` | base64 SPNEGO token for `HTTP/<host>` (raises on failure) |
+| `negotiate_token(url, service)` | token for `<service>/<host>` — `LDAP`, `cifs`, `host`, … |
+| `negotiate_token_describe(url)` | a JSON diagnostics blob (SPN, provider, token-or-error); never raises |
+
+```sql
+CREATE SECRET kerb (TYPE http, EXTRA_HTTP_HEADERS MAP {
+    'Authorization': 'Negotiate ' || negotiate_token('https://intranet.example/')
+});
+```
 
 ## Refresh / auto-rotation
 
@@ -130,8 +149,9 @@ Caveats, stated plainly:
 
 ## Build, test, CI
 
-- `make` builds against pinned **duckdb v1.5.4** + `extension-ci-tools` (git submodules);
-  `make test` runs the suite. (`httpfs` is `INSTALL`/`LOAD`ed at test time, not compiled
+- `make` builds against pinned **duckdb v1.5.4** + `extension-ci-tools` + the
+  [`spnego-token`](https://github.com/phrrngtn/spnego-token) submodule (clone
+  `--recursive` to also get its nested `nlohmann/json`); `make test` runs the suite. (`httpfs` is `INSTALL`/`LOAD`ed at test time, not compiled
   in — it supplies the s3 secret *type* and the `HTTPUtil` used for the STS call.)
 - **GitHub Actions** builds the full distribution matrix (linux amd64/arm64, macOS
   amd64/arm64, windows mingw+MSVC, wasm). A **Forgejo** workflow additionally builds on
@@ -143,7 +163,7 @@ Caveats, stated plainly:
 CMakeLists.txt                     # links only ${CMAKE_DL_LIBS} (+ secur32 on Windows)
 src/blobsso_extension.cpp          # the 'sso' provider: token acquisition + STS + KeyValueSecret
 src/include/blobsso_extension.hpp
-third_party/negotiate/             # vendored from blobhttp: SPNEGO token via dlopen'd GSS-API
+third_party/spnego-token/          # submodule: shared SPNEGO atom (+ nested nlohmann/json)
 test/sql/blobsso.test              # sqllogictest: registration + input validation
 test/mock_sts_test.py              # mock-STS round-trip integration test
 .github/workflows/                 # multi-arch distribution pipeline

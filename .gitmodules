@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = v1.5.4
+[submodule "third_party/spnego-token"]
+	path = third_party/spnego-token
+	url = https://github.com/phrrngtn/spnego-token.git

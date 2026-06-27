@@ -7,8 +7,11 @@
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/common/vector_operations/binary_executor.hpp"
+#include "duckdb/function/function_set.hpp"
 
-#include "negotiate_auth.hpp" // vendored from blobhttp: SPNEGO token via dlopen'd GSS-API
+#include "spnego_token.hpp" // shared submodule (spnego-token): preemptive SPNEGO token via dlopen'd GSS-API
 
 #include <cctype>
 
@@ -148,7 +151,7 @@ static string AcquireTokenViaSpnego(ClientContext &context, HTTPUtil &http_util,
 	const bool allow_http = GetOption(input, "allow_http_negotiate") == "true";
 	string negotiate;
 	try {
-		negotiate = blobhttp::GenerateNegotiateToken(auth_endpoint, allow_http).token;
+		negotiate = spnego::GenerateTokenForUrl(auth_endpoint, allow_http).token;
 	} catch (const std::exception &e) {
 		throw InvalidInputException("blobsso 'sso' provider: SPNEGO/Kerberos token generation failed (%s). "
 		                            "Do you have a ticket (kinit)?",
@@ -315,8 +318,54 @@ static void RegisterSSOSecretProvider(ExtensionLoader &loader) {
 	loader.RegisterFunction(sso);
 }
 
+//===--------------------------------------------------------------------===//
+// Scalar UDFs over the shared spnego-token atom: mint a preemptive Negotiate token for
+// any URL (optionally a non-HTTP service class) so it can be dropped into other requests
+// (EXTRA_HTTP_HEADERS, a TYPE http secret, ad-hoc SQL). VOLATILE — the token embeds a
+// timestamp, so a fresh one is produced per call (never constant-folded).
+//===--------------------------------------------------------------------===//
+static void NegotiateTokenFun(DataChunk &args, ExpressionState &, Vector &result) {
+	if (args.ColumnCount() > 1) {
+		BinaryExecutor::Execute<string_t, string_t, string_t>(
+		    args.data[0], args.data[1], result, args.size(), [&](string_t url, string_t service) {
+			    auto tok = spnego::GenerateTokenForUrl(url.GetString(), false, service.GetString()).token;
+			    return StringVector::AddString(result, tok);
+		    });
+	} else {
+		UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t url) {
+			auto tok = spnego::GenerateTokenForUrl(url.GetString()).token;
+			return StringVector::AddString(result, tok);
+		});
+	}
+}
+
+static void NegotiateTokenDescribeFun(DataChunk &args, ExpressionState &, Vector &result) {
+	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t url) {
+		return StringVector::AddString(result, spnego::DescribeTokenForUrl(url.GetString()));
+	});
+}
+
+static void RegisterNegotiateFunctions(ExtensionLoader &loader) {
+	// negotiate_token(url[, service]) -> base64 SPNEGO token (raises on failure)
+	ScalarFunctionSet token("negotiate_token");
+	ScalarFunction one({LogicalType::VARCHAR}, LogicalType::VARCHAR, NegotiateTokenFun);
+	one.stability = FunctionStability::VOLATILE;
+	token.AddFunction(one);
+	ScalarFunction two({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR, NegotiateTokenFun);
+	two.stability = FunctionStability::VOLATILE;
+	token.AddFunction(two);
+	loader.RegisterFunction(token);
+
+	// negotiate_token_describe(url) -> JSON diagnostics (never raises)
+	ScalarFunction describe("negotiate_token_describe", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                        NegotiateTokenDescribeFun);
+	describe.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(describe);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterSSOSecretProvider(loader);
+	RegisterNegotiateFunctions(loader);
 }
 
 void BlobssoExtension::Load(ExtensionLoader &loader) {

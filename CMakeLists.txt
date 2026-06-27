@@ -16,9 +16,13 @@ project(${TARGET_NAME})
 set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include_directories(src/include third_party/negotiate)
+# spnego-token submodule provides the SPNEGO atom; its nested nlohmann/json (used by the
+# atom's JSON debug entry-point) must be on the include path too.
+include_directories(src/include
+                    third_party/spnego-token
+                    third_party/spnego-token/third_party/json/single_include)
 
-set(EXTENSION_SOURCES src/blobsso_extension.cpp third_party/negotiate/negotiate_auth.cpp)
+set(EXTENSION_SOURCES src/blobsso_extension.cpp third_party/spnego-token/spnego_token.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
