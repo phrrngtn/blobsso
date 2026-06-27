@@ -1,5 +1,7 @@
 # blobsso  *(working name — may change)*
 
+[![Build](https://github.com/phrrngtn/blobsso/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/phrrngtn/blobsso/actions/workflows/MainDistributionPipeline.yml)
+
 > **Note:** This code is almost entirely AI-authored (Claude, Anthropic), albeit under close human supervision, and is for research and experimentation purposes. Successful experiments may be re-implemented in a more coordinated and curated manner.
 
 A **DuckDB C++ extension** that turns an **enterprise identity** — a JWT, or a
