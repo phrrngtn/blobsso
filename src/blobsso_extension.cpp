@@ -114,60 +114,62 @@ static string HttpPostForm(HTTPUtil &http_util, HTTPParams &params, const string
 }
 
 //===--------------------------------------------------------------------===//
-// Stage 2: acquire the JWT via Kerberos/SPNEGO against an OIDC provider.
+// Stage 1: acquire the JWT. Factored into the *generic* OIDC authorization-code flow
+// (OidcDiscover / OidcExchangeCode — no credential knowledge) and the single credential
+// step that authenticates to the authorization endpoint (SpnegoAuthorize). SPNEGO is just
+// the non-interactive, browserless way we obtain the code — which is what lets this run
+// headless from ODBC/Tableau. Swapping the IdP-auth method means swapping SpnegoAuthorize;
+// the OIDC pipeline (the reusable part of the proof) is untouched.
 //
-//   kinit ticket -> Authorization: Negotiate -> OIDC auth-code -> JWT.
-// The SPNEGO token is generated from the OS Kerberos credential (GSS-API);
-// the host's krb5.conf should set `dns_canonicalize_hostname = false` so the
-// SPN matches the issuer's hostname (HTTP/<issuer-host>) rather than a CNAME.
+// The host's krb5.conf should set `dns_canonicalize_hostname = false` so the SPN matches
+// the issuer host (HTTP/<issuer-host>) rather than a DNS CNAME.
 //===--------------------------------------------------------------------===//
-static string AcquireTokenViaSpnego(ClientContext &context, HTTPUtil &http_util, const CreateSecretInput &input) {
-	const string issuer = GetOption(input, "oidc_issuer");
-	const string client_id = GetOption(input, "client_id");
-	const string client_secret = GetOption(input, "client_secret");
-	const string redirect_uri = GetOption(input, "redirect_uri", "http://localhost/cb");
-	if (client_id.empty()) {
-		throw InvalidInputException("blobsso 'sso' provider: 'client_id' is required with 'oidc_issuer'.");
-	}
 
-	auto params = http_util.InitializeParameters(context, issuer);
+struct OidcEndpoints {
+	string authorization_endpoint;
+	string token_endpoint;
+};
 
-	// 1. OIDC discovery -> authorization_endpoint, token_endpoint
-	params->follow_location = true;
+// Generic OIDC discovery — credential-agnostic.
+static OidcEndpoints OidcDiscover(HTTPUtil &http_util, HTTPParams &params, const string &issuer) {
+	params.follow_location = true;
 	string disc_body;
 	HTTPHeaders no_headers;
-	HttpGet(http_util, *params, issuer + "/.well-known/openid-configuration", no_headers, disc_body);
-	const string auth_endpoint = ExtractJsonString(disc_body, "authorization_endpoint");
-	const string token_endpoint = ExtractJsonString(disc_body, "token_endpoint");
-	if (auth_endpoint.empty() || token_endpoint.empty()) {
-		throw InvalidInputException("blobsso 'sso' provider: OIDC discovery failed at %s/.well-known/"
-		                            "openid-configuration",
+	HttpGet(http_util, params, issuer + "/.well-known/openid-configuration", no_headers, disc_body);
+	OidcEndpoints ep;
+	ep.authorization_endpoint = ExtractJsonString(disc_body, "authorization_endpoint");
+	ep.token_endpoint = ExtractJsonString(disc_body, "token_endpoint");
+	if (ep.authorization_endpoint.empty() || ep.token_endpoint.empty()) {
+		throw InvalidInputException("blobsso 'sso' provider: OIDC discovery failed at "
+		                            "%s/.well-known/openid-configuration",
 		                            issuer);
 	}
+	return ep;
+}
 
-	// 2. SPNEGO token for HTTP/<auth-host> from the OS Kerberos credential.
-	// By default Negotiate requires HTTPS (replay protection); allow_http_negotiate
-	// opts into plain HTTP when the transport is already encrypted (e.g. Tailscale).
-	const bool allow_http = GetOption(input, "allow_http_negotiate") == "true";
+// Credential step (the only SPNEGO-specific piece): obtain an authorization code from the
+// authorization endpoint with a pre-flight Negotiate token minted from the ambient Kerberos
+// ticket — no browser, so it works headless (ODBC/Tableau). allow_http opts into plain HTTP
+// when the transport is already encrypted (e.g. Tailscale).
+static string SpnegoAuthorize(HTTPUtil &http_util, HTTPParams &params, const string &authorization_endpoint,
+                              const string &client_id, const string &redirect_uri, bool allow_http) {
 	string negotiate;
 	try {
-		negotiate = spnego::GenerateTokenForUrl(auth_endpoint, allow_http).token;
+		negotiate = spnego::GenerateTokenForUrl(authorization_endpoint, allow_http).token;
 	} catch (const std::exception &e) {
 		throw InvalidInputException("blobsso 'sso' provider: SPNEGO/Kerberos token generation failed (%s). "
 		                            "Do you have a ticket (kinit)?",
 		                            e.what());
 	}
-
-	// 3. Proactive Negotiate GET on the auth endpoint -> 302 with ?code=
-	const string auth_url = auth_endpoint + "?client_id=" + UrlEncode(client_id) +
+	const string auth_url = authorization_endpoint + "?client_id=" + UrlEncode(client_id) +
 	                        "&response_type=code&scope=openid&redirect_uri=" + UrlEncode(redirect_uri) +
 	                        "&state=blobsso";
 	HTTPHeaders auth_headers;
 	auth_headers.Insert("Authorization", "Negotiate " + negotiate);
-	params->follow_location = false;
+	params.follow_location = false;
 	string ignore;
-	auto resp = HttpGet(http_util, *params, auth_url, auth_headers, ignore);
-	string location = (resp && resp->HasHeader("Location")) ? resp->GetHeaderValue("Location") : "";
+	auto resp = HttpGet(http_util, params, auth_url, auth_headers, ignore);
+	const string location = (resp && resp->HasHeader("Location")) ? resp->GetHeaderValue("Location") : "";
 	auto cpos = location.find("code=");
 	if (cpos == string::npos) {
 		throw InvalidInputException("blobsso 'sso' provider: SPNEGO auth did not yield an authorization code "
@@ -176,22 +178,44 @@ static string AcquireTokenViaSpnego(ClientContext &context, HTTPUtil &http_util,
 	}
 	cpos += 5;
 	auto cend = location.find('&', cpos);
-	const string code = location.substr(cpos, cend == string::npos ? string::npos : cend - cpos);
+	return location.substr(cpos, cend == string::npos ? string::npos : cend - cpos);
+}
 
-	// 4. Exchange the code for the JWT
-	string token_body = "grant_type=authorization_code&code=" + UrlEncode(code) + "&client_id=" + UrlEncode(client_id) +
-	                    "&redirect_uri=" + UrlEncode(redirect_uri);
+// Generic OIDC authorization-code -> token exchange — credential-agnostic.
+static string OidcExchangeCode(HTTPUtil &http_util, HTTPParams &params, const string &token_endpoint,
+                               const string &code, const string &client_id, const string &client_secret,
+                               const string &redirect_uri) {
+	string token_body = "grant_type=authorization_code&code=" + UrlEncode(code) +
+	                    "&client_id=" + UrlEncode(client_id) + "&redirect_uri=" + UrlEncode(redirect_uri);
 	if (!client_secret.empty()) {
 		token_body += "&client_secret=" + UrlEncode(client_secret);
 	}
-	params->follow_location = true;
-	const string token_resp = HttpPostForm(http_util, *params, token_endpoint, token_body);
+	params.follow_location = true;
+	const string token_resp = HttpPostForm(http_util, params, token_endpoint, token_body);
 	const string jwt = ExtractJsonString(token_resp, "access_token");
 	if (jwt.empty()) {
 		throw InvalidInputException("blobsso 'sso' provider: code exchange returned no access_token. Body: %s",
 		                            token_resp);
 	}
 	return jwt;
+}
+
+// Compose: OIDC discovery -> SPNEGO authorization -> code exchange -> JWT.
+static string AcquireTokenViaSpnego(ClientContext &context, HTTPUtil &http_util, const CreateSecretInput &input) {
+	const string issuer = GetOption(input, "oidc_issuer");
+	const string client_id = GetOption(input, "client_id");
+	const string client_secret = GetOption(input, "client_secret");
+	const string redirect_uri = GetOption(input, "redirect_uri", "http://localhost/cb");
+	const bool allow_http = GetOption(input, "allow_http_negotiate") == "true";
+	if (client_id.empty()) {
+		throw InvalidInputException("blobsso 'sso' provider: 'client_id' is required with 'oidc_issuer'.");
+	}
+
+	auto params = http_util.InitializeParameters(context, issuer);
+	const OidcEndpoints ep = OidcDiscover(http_util, *params, issuer);
+	const string code =
+	    SpnegoAuthorize(http_util, *params, ep.authorization_endpoint, client_id, redirect_uri, allow_http);
+	return OidcExchangeCode(http_util, *params, ep.token_endpoint, code, client_id, client_secret, redirect_uri);
 }
 
 // Resolve the web-identity JWT: inline token, token file, env var, or — when an
