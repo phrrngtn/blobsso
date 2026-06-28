@@ -208,6 +208,10 @@ overhead of object storage — not the SQL engine. See
 (DuckLake catalog for metadata, `cache_httpfs` for repeated data) — all driven by one keyless
 `CREATE SECRET`, with `BLOBSSO_TIMING=1` for the per-step breakdown.
 
+For the broader architecture this enables — out-of-band catalog writes and zero-copy facets over
+on-prem object storage (cloud→on-prem data repatriation, governed by SSO reads) — see
+**[docs/Disaggregated Lakehouse.md](docs/Disaggregated%20Lakehouse.md)**.
+
 ## Layout
 
 ```
