@@ -108,22 +108,30 @@ static void TimingMark(const char *label, std::chrono::steady_clock::time_point 
 // HTTP via httpfs's core HTTPUtil (no HTTP library linked here)
 //===--------------------------------------------------------------------===//
 
+// `client` (optional): a persistent HTTPClient to reuse the connection (keep-alive) across
+// calls to the same host — pass it to collapse repeated TLS handshakes into one.
 static unique_ptr<HTTPResponse> HttpGet(HTTPUtil &http_util, HTTPParams &params, const string &url,
-                                        const HTTPHeaders &headers, string &body_out) {
+                                        const HTTPHeaders &headers, string &body_out,
+                                        unique_ptr<HTTPClient> *client = nullptr) {
 	GetRequestInfo req(
 	    url, headers, params, [](const HTTPResponse &) { return true; },
 	    [&body_out](const_data_ptr_t data, idx_t len) {
 		    body_out.append(reinterpret_cast<const char *>(data), len);
 		    return true;
 	    });
-	return http_util.Request(req);
+	return client ? http_util.Request(req, *client) : http_util.Request(req);
 }
 
-static string HttpPostForm(HTTPUtil &http_util, HTTPParams &params, const string &url, const string &body) {
+static string HttpPostForm(HTTPUtil &http_util, HTTPParams &params, const string &url, const string &body,
+                           unique_ptr<HTTPClient> *client = nullptr) {
 	HTTPHeaders headers;
 	headers.Insert("Content-Type", "application/x-www-form-urlencoded");
 	PostRequestInfo post(url, headers, params, reinterpret_cast<const_data_ptr_t>(body.data()), body.size());
-	http_util.Request(post);
+	if (client) {
+		http_util.Request(post, *client);
+	} else {
+		http_util.Request(post);
+	}
 	return post.buffer_out;
 }
 
@@ -145,11 +153,12 @@ struct OidcEndpoints {
 };
 
 // Generic OIDC discovery — credential-agnostic.
-static OidcEndpoints OidcDiscover(HTTPUtil &http_util, HTTPParams &params, const string &issuer) {
+static OidcEndpoints OidcDiscover(HTTPUtil &http_util, HTTPParams &params, const string &issuer,
+                                  unique_ptr<HTTPClient> *client = nullptr) {
 	params.follow_location = true;
 	string disc_body;
 	HTTPHeaders no_headers;
-	HttpGet(http_util, params, issuer + "/.well-known/openid-configuration", no_headers, disc_body);
+	HttpGet(http_util, params, issuer + "/.well-known/openid-configuration", no_headers, disc_body, client);
 	OidcEndpoints ep;
 	ep.authorization_endpoint = ExtractJsonString(disc_body, "authorization_endpoint");
 	ep.token_endpoint = ExtractJsonString(disc_body, "token_endpoint");
@@ -166,7 +175,8 @@ static OidcEndpoints OidcDiscover(HTTPUtil &http_util, HTTPParams &params, const
 // ticket — no browser, so it works headless (ODBC/Tableau). allow_http opts into plain HTTP
 // when the transport is already encrypted (e.g. Tailscale).
 static string SpnegoAuthorize(HTTPUtil &http_util, HTTPParams &params, const string &authorization_endpoint,
-                              const string &client_id, const string &redirect_uri, bool allow_http) {
+                              const string &client_id, const string &redirect_uri, bool allow_http,
+                              unique_ptr<HTTPClient> *client = nullptr) {
 	auto t = TimingNow();
 	string negotiate;
 	try {
@@ -185,7 +195,7 @@ static string SpnegoAuthorize(HTTPUtil &http_util, HTTPParams &params, const str
 	params.follow_location = false;
 	string ignore;
 	t = TimingNow();
-	auto resp = HttpGet(http_util, params, auth_url, auth_headers, ignore);
+	auto resp = HttpGet(http_util, params, auth_url, auth_headers, ignore, client);
 	TimingMark("  authorize_get", t);
 	const string location = (resp && resp->HasHeader("Location")) ? resp->GetHeaderValue("Location") : "";
 	auto cpos = location.find("code=");
@@ -202,14 +212,14 @@ static string SpnegoAuthorize(HTTPUtil &http_util, HTTPParams &params, const str
 // Generic OIDC authorization-code -> token exchange — credential-agnostic.
 static string OidcExchangeCode(HTTPUtil &http_util, HTTPParams &params, const string &token_endpoint,
                                const string &code, const string &client_id, const string &client_secret,
-                               const string &redirect_uri) {
+                               const string &redirect_uri, unique_ptr<HTTPClient> *client = nullptr) {
 	string token_body = "grant_type=authorization_code&code=" + UrlEncode(code) + "&client_id=" + UrlEncode(client_id) +
 	                    "&redirect_uri=" + UrlEncode(redirect_uri);
 	if (!client_secret.empty()) {
 		token_body += "&client_secret=" + UrlEncode(client_secret);
 	}
 	params.follow_location = true;
-	const string token_resp = HttpPostForm(http_util, params, token_endpoint, token_body);
+	const string token_resp = HttpPostForm(http_util, params, token_endpoint, token_body, client);
 	const string jwt = ExtractJsonString(token_resp, "access_token");
 	if (jwt.empty()) {
 		throw InvalidInputException("blobsso 'sso' provider: code exchange returned no access_token. Body: %s",
@@ -230,16 +240,24 @@ static string AcquireTokenViaSpnego(ClientContext &context, HTTPUtil &http_util,
 	}
 
 	auto params = http_util.InitializeParameters(context, issuer);
+	// One keep-alive client for the Keycloak host: discovery, authorize, and token all hit the
+	// same host, so reuse one TLS connection instead of a fresh handshake per call.
+	auto authority_end = issuer.find('/', issuer.find("://") + 3);
+	const string keycloak_authority = authority_end == string::npos ? issuer : issuer.substr(0, authority_end);
+	auto kc = http_util.InitializeClient(*params, keycloak_authority);
+
 	auto t = TimingNow();
-	const OidcEndpoints ep = OidcDiscover(http_util, *params, issuer);
+	const OidcEndpoints ep = OidcDiscover(http_util, *params, issuer, &kc);
 	TimingMark("oidc_discover", t);
 	t = TimingNow();
+	// NOTE: authorize must NOT reuse the client — it needs follow_location=false to capture the
+	// 302 (code in Location), which a reused client overrides. It uses its own connection.
 	const string code =
 	    SpnegoAuthorize(http_util, *params, ep.authorization_endpoint, client_id, redirect_uri, allow_http);
 	TimingMark("spnego_authorize", t);
 	t = TimingNow();
 	const string jwt =
-	    OidcExchangeCode(http_util, *params, ep.token_endpoint, code, client_id, client_secret, redirect_uri);
+	    OidcExchangeCode(http_util, *params, ep.token_endpoint, code, client_id, client_secret, redirect_uri, &kc);
 	TimingMark("oidc_token_exchange", t);
 	return jwt;
 }
