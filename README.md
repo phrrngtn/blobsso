@@ -199,6 +199,15 @@ Caveats, stated plainly:
   amd64/arm64, windows mingw+MSVC, wasm). A **Forgejo** workflow additionally builds on
   self-hosted runners.
 
+## Performance
+
+In an enterprise setting the costs that matter are the auth handshake and the per-object
+overhead of object storage — not the SQL engine. See
+**[docs/blobsso Performance.md](docs/blobsso%20Performance.md)** for measured numbers
+(one-time SSO ~230ms; ~8–12ms per S3 object open) and the layered mitigations that retire them
+(DuckLake catalog for metadata, `cache_httpfs` for repeated data) — all driven by one keyless
+`CREATE SECRET`, with `BLOBSSO_TIMING=1` for the per-step breakdown.
+
 ## Layout
 
 ```
