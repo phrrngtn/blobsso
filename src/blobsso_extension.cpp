@@ -14,6 +14,8 @@
 #include "spnego_token.hpp" // shared submodule (spnego-token): preemptive SPNEGO token via dlopen'd GSS-API
 
 #include <cctype>
+#include <chrono>
+#include <cstdio>
 
 namespace duckdb {
 
@@ -90,6 +92,18 @@ static string GetOption(const CreateSecretInput &input, const string &key, const
 	return fallback;
 }
 
+// Optional per-step timing for the SSO chain. Set BLOBSSO_TIMING=1 to print a stderr
+// breakdown; off by default (a single getenv check, no other overhead).
+static std::chrono::steady_clock::time_point TimingNow() {
+	return std::chrono::steady_clock::now();
+}
+static void TimingMark(const char *label, std::chrono::steady_clock::time_point since) {
+	if (std::getenv("BLOBSSO_TIMING")) {
+		auto ms = std::chrono::duration<double, std::milli>(TimingNow() - since).count();
+		fprintf(stderr, "blobsso: %-20s %8.2f ms\n", label, ms);
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // HTTP via httpfs's core HTTPUtil (no HTTP library linked here)
 //===--------------------------------------------------------------------===//
@@ -153,6 +167,7 @@ static OidcEndpoints OidcDiscover(HTTPUtil &http_util, HTTPParams &params, const
 // when the transport is already encrypted (e.g. Tailscale).
 static string SpnegoAuthorize(HTTPUtil &http_util, HTTPParams &params, const string &authorization_endpoint,
                               const string &client_id, const string &redirect_uri, bool allow_http) {
+	auto t = TimingNow();
 	string negotiate;
 	try {
 		negotiate = spnego::GenerateTokenForUrl(authorization_endpoint, allow_http).token;
@@ -161,6 +176,7 @@ static string SpnegoAuthorize(HTTPUtil &http_util, HTTPParams &params, const str
 		                            "Do you have a ticket (kinit)?",
 		                            e.what());
 	}
+	TimingMark("  spnego_gen", t);
 	const string auth_url = authorization_endpoint + "?client_id=" + UrlEncode(client_id) +
 	                        "&response_type=code&scope=openid&redirect_uri=" + UrlEncode(redirect_uri) +
 	                        "&state=blobsso";
@@ -168,7 +184,9 @@ static string SpnegoAuthorize(HTTPUtil &http_util, HTTPParams &params, const str
 	auth_headers.Insert("Authorization", "Negotiate " + negotiate);
 	params.follow_location = false;
 	string ignore;
+	t = TimingNow();
 	auto resp = HttpGet(http_util, params, auth_url, auth_headers, ignore);
+	TimingMark("  authorize_get", t);
 	const string location = (resp && resp->HasHeader("Location")) ? resp->GetHeaderValue("Location") : "";
 	auto cpos = location.find("code=");
 	if (cpos == string::npos) {
@@ -212,10 +230,18 @@ static string AcquireTokenViaSpnego(ClientContext &context, HTTPUtil &http_util,
 	}
 
 	auto params = http_util.InitializeParameters(context, issuer);
+	auto t = TimingNow();
 	const OidcEndpoints ep = OidcDiscover(http_util, *params, issuer);
+	TimingMark("oidc_discover", t);
+	t = TimingNow();
 	const string code =
 	    SpnegoAuthorize(http_util, *params, ep.authorization_endpoint, client_id, redirect_uri, allow_http);
-	return OidcExchangeCode(http_util, *params, ep.token_endpoint, code, client_id, client_secret, redirect_uri);
+	TimingMark("spnego_authorize", t);
+	t = TimingNow();
+	const string jwt =
+	    OidcExchangeCode(http_util, *params, ep.token_endpoint, code, client_id, client_secret, redirect_uri);
+	TimingMark("oidc_token_exchange", t);
+	return jwt;
 }
 
 // Resolve the web-identity JWT: inline token, token file, env var, or — when an
@@ -253,7 +279,9 @@ static unique_ptr<BaseSecret> CreateS3SecretFromSSO(ClientContext &context, Crea
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto &http_util = HTTPUtil::Get(db);
 
+	auto t_jwt = TimingNow();
 	const string token = AcquireWebIdentityToken(context, http_util, input);
+	TimingMark("jwt_total", t_jwt);
 	const string role_arn = GetOption(input, "role_arn");
 	const string duration = GetOption(input, "duration_seconds");
 	const string session_name = GetOption(input, "role_session_name", "blobsso");
@@ -269,7 +297,9 @@ static unique_ptr<BaseSecret> CreateS3SecretFromSSO(ClientContext &context, Crea
 	}
 
 	auto params = http_util.InitializeParameters(context, sts_endpoint);
+	auto t_sts = TimingNow();
 	const string xml = HttpPostForm(http_util, *params, sts_endpoint, body);
+	TimingMark("sts_assume_role", t_sts);
 
 	if (xml.find("<ErrorResponse") != string::npos || xml.find("<Error>") != string::npos) {
 		string code = ExtractXmlTag(xml, "Code");
